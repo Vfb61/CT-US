@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Data (large files, download separately)
+dataset/
+outputs/
+
+# PyTorch checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Temporary
+*.tmp
+*.log
