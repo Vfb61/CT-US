@@ -158,6 +158,12 @@ def load_sample(row):
     img = nib.load(str(ct_path))
     ct = np.asarray(img.get_fdata(), dtype=np.float32)
     affine_ct = np.asarray(img.affine, dtype=np.float64)
+    # cap CT memory: resize if total voxels > 600K (matches preprocess_ct output)
+    max_ct_voxels = 600_000
+    if ct.size > max_ct_voxels:
+        from scipy.ndimage import zoom
+        scale = (max_ct_voxels / ct.size) ** (1.0 / 3)
+        ct = zoom(ct, scale, order=1).astype(np.float32)
 
     us_img = Image.open(base / row["sid"] / row["files"]["us"]).convert("L")
     us = np.asarray(us_img, dtype=np.float32) / 255.0
@@ -171,6 +177,12 @@ def load_sample(row):
 
     seg_vol_path = base / row["volume"].replace("_ct.nii.gz", "_seg.nii.gz")
     seg_vol = np.asarray(nib.load(str(seg_vol_path)).get_fdata(), dtype=np.int64)
+    # cap seg_vol memory: resize if total voxels > 200K
+    max_seg_voxels = 200_000
+    if seg_vol.size > max_seg_voxels:
+        from scipy.ndimage import zoom
+        scale = (max_seg_voxels / seg_vol.size) ** (1.0 / 3)
+        seg_vol = zoom(seg_vol, scale, order=0).astype(np.int64)
 
     pr = row["params"]["probe"]
     return {
@@ -691,9 +703,20 @@ def train(args):
                 tot_seg / max(1, steps), float(np.mean(tre_list)))
 
     best_tre = float("inf")
+    history = {"ep": [], "train_pose": [], "train_app": [], "train_seg": [], "train_tre": [],
+               "val_pose": [], "val_app": [], "val_seg": [], "val_tre": []}
     for ep in range(1, args.epochs + 1):
         tp, ta, tse, tret = run_epoch(train_data, train_mode=True)
         vp, va, vse, trev = run_epoch(val_data, train_mode=False)
+        history["ep"].append(ep)
+        history["train_pose"].append(tp)
+        history["train_app"].append(ta)
+        history["train_seg"].append(tse)
+        history["train_tre"].append(tret)
+        history["val_pose"].append(vp)
+        history["val_app"].append(va)
+        history["val_seg"].append(vse)
+        history["val_tre"].append(trev)
         print(f"epoch {ep:3d}  train pose={tp:.4f} app={ta:.4f} seg={tse:.3f} TRE={tret:.2f}mm | "
               f"val pose={vp:.4f} app={va:.4f} seg={vse:.3f} TRE={trev:.2f}mm")
         if trev < best_tre:
@@ -701,6 +724,51 @@ def train(args):
             torch.save(model.state_dict(), args.checkpoint)
             print(f"  saved best -> {args.checkpoint}")
     print(f"best val TRE = {best_tre:.2f} mm")
+
+    # save training curves
+    _save_curves(history, args)
+
+
+def _save_curves(history, args):
+    """Plot and save training curves as PNG."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        print("[viz] matplotlib not available, skipping curves")
+        return
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    ep = history["ep"]
+    # pose loss
+    axes[0, 0].plot(ep, history["train_pose"], label="train")
+    axes[0, 0].plot(ep, history["val_pose"], label="val")
+    axes[0, 0].set_title("Pose Loss")
+    axes[0, 0].set_xlabel("epoch")
+    axes[0, 0].legend()
+    # seg loss
+    axes[0, 1].plot(ep, history["train_seg"], label="train")
+    axes[0, 1].plot(ep, history["val_seg"], label="val")
+    axes[0, 1].set_title("Seg Loss")
+    axes[0, 1].set_xlabel("epoch")
+    axes[0, 1].legend()
+    # app loss
+    axes[1, 0].plot(ep, history["train_app"], label="train")
+    axes[1, 0].plot(ep, history["val_app"], label="val")
+    axes[1, 0].set_title("App Loss")
+    axes[1, 0].set_xlabel("epoch")
+    axes[1, 0].legend()
+    # TRE
+    axes[1, 1].plot(ep, history["train_tre"], label="train")
+    axes[1, 1].plot(ep, history["val_tre"], label="val")
+    axes[1, 1].set_title("TRE (mm)")
+    axes[1, 1].set_xlabel("epoch")
+    axes[1, 1].legend()
+    fig.tight_layout()
+    out = Path(args.checkpoint).with_name("training_curves.png")
+    fig.savefig(str(out), dpi=150)
+    plt.close(fig)
+    print(f"  curves saved -> {out}")
 
 
 def main():

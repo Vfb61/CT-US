@@ -56,6 +56,44 @@ def _is_deformed(row) -> bool:
     return bool(d.get("resp_amp_mm", 0.0) or d.get("compression_mm", 0.0))
 
 
+def _torch_check(row) -> dict:
+    """Cross-validate torch fan-accurate reslice vs stored slices."""
+    try:
+        from train.baseline_registration import load_sample, reslice_pose, reslice_label
+        import torch
+    except Exception as e:  # noqa: BLE001
+        return {"sid": row["sid"], "torch_error": str(e)}
+
+    base = Path(row["_base"])
+    sample = load_sample(row)
+    M_gt = sample["us_to_ct"]
+
+    # CT reslice at GT pose (should match stored ct_slice pixel-exactly)
+    with torch.no_grad():
+        re_ct = reslice_pose(sample, M_gt).squeeze().cpu().numpy()
+    stored_ct, _, _ = io_utils.load_volume(base / row["sid"] / "ct_slice.nii.gz")
+    ct_diff = re_ct - stored_ct
+    ct_rms = float(np.sqrt(np.mean(np.square(ct_diff))))
+    ct_maxabs = float(np.max(np.abs(ct_diff)))
+
+    # Seg reslice at GT pose (bilinear soft labels vs stored nearest-neighbor)
+    with torch.no_grad():
+        re_seg = reslice_label(sample, M_gt).squeeze().cpu().numpy()
+    stored_seg, _, _ = io_utils.load_volume(base / row["sid"] / "seg_slice.nii.gz")
+    # reslice_label uses bilinear (soft) labels for differentiability;
+    # stored seg_slice was resampled with order=0 (nearest).
+    # Geometric position is identical; mismatch at tissue boundaries is expected.
+    seg_exact = bool(np.array_equal(re_seg.astype(int), stored_seg.astype(int)))
+    seg_rounded = bool(np.all(np.round(re_seg).astype(int) == stored_seg.astype(int)))
+
+    return {
+        "sid": row["sid"], "kind": row["params"]["probe"]["kind"],
+        "deformed": _is_deformed(row),
+        "torch_ct_rms": ct_rms, "torch_ct_maxabs": ct_maxabs,
+        "torch_seg_exact": seg_exact, "torch_seg_rounded": seg_rounded,
+    }
+
+
 def _check(row) -> dict:
     base = Path(row["_base"])
     pr = row["params"]["probe"]
@@ -102,6 +140,8 @@ def main():
     ap.add_argument("--show", action="store_true", help="print every sample line")
     ap.add_argument("--strict", action="store_true",
                     help="treat any rigid-sample RMS above --threshold as failure")
+    ap.add_argument("--torch", action="store_true",
+                    help="also cross-validate torch fan-accurate reslice vs stored slices")
     ap.add_argument("--threshold", type=float, default=0.05,
                     help="RMS (HU) threshold for rigid-sample failure")
     args = ap.parse_args()
@@ -125,7 +165,10 @@ def main():
     results = []
     for r in rows:
         try:
-            results.append(_check(r))
+            res = _check(r)
+            if args.torch:
+                res.update(_torch_check(r))
+            results.append(res)
         except Exception as e:  # noqa: BLE001
             br = {"sid": r["sid"], "error": str(e)}
             results.append(br)
@@ -140,10 +183,15 @@ def main():
             if "error" in r:
                 continue
             tag = "DEFORMED" if r["deformed"] else "  rigid "
-            print(f"{tag} {r['sid']:<24} kind={r['kind']:<6} rms={r['rms']:9.4f} "
-                  f"rel={r['rel']:.3e} det={r['det']:+.4f} "
-                  f"Tmatch={r['tmatch']:.2e} aff= {r['amatch']:.2e} "
-                  f"labels={r['labels_match']}")
+            line = (f"{tag} {r['sid']:<24} kind={r['kind']:<6} rms={r['rms']:9.4f} "
+                    f"rel={r['rel']:.3e} det={r['det']:+.4f} "
+                    f"Tmatch={r['tmatch']:.2e} aff= {r['amatch']:.2e} "
+                    f"labels={r['labels_match']}")
+            if "torch_ct_rms" in r:
+                line += (f" | torch_ct_rms={r['torch_ct_rms']:.4f} "
+                         f"maxabs={r['torch_ct_maxabs']:.4f} "
+                         f"seg_exact={r['torch_seg_exact']} rounded={r['torch_seg_rounded']}")
+            print(line)
 
     print(f"samples={len(rows)}  rigid={len(rigid)}  deformed={deformed}  errors={len(results)-len(ok_rows)}")
     if rigid:
@@ -157,6 +205,18 @@ def main():
         print("determinants: min=%.4f max=%.4f" % (min(dets), max(dets)))
     print("labels resample identical to stored seg_slice:",
           sum(1 for r in ok_rows if r["labels_match"]), "/", len(ok_rows))
+
+    # torch cross-validation summary
+    torch_rows = [r for r in ok_rows if "torch_ct_rms" in r]
+    if torch_rows:
+        ct_rms = [r["torch_ct_rms"] for r in torch_rows]
+        ct_ma = [r["torch_ct_maxabs"] for r in torch_rows]
+        seg_exact = sum(1 for r in torch_rows if r["torch_seg_exact"])
+        seg_rounded = sum(1 for r in torch_rows if r["torch_seg_rounded"])
+        print(f"torch reslice: ct_rms mean={np.mean(ct_rms):.4f} max={max(ct_rms):.4f} | "
+              f"ct_maxabs max={max(ct_ma):.4f}")
+        print(f"  seg: exact={seg_exact}/{len(torch_rows)} rounded={seg_rounded}/{len(torch_rows)} "
+              f"(bilinear vs nearest: boundary mismatch is expected)")
 
     if args.strict and (failed or len(rigid) == 0):
         print(f"FAIL: {len(failed)} rigid sample(s) above threshold "

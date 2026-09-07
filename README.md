@@ -74,6 +74,7 @@ ct2us/
 scripts/
   render_demo.py     单个体积快速演示，输出预览图
   generate_dataset.py 大规模生成 {CT,US,T_CT→US} 配对数据集
+  generate_for_new.py 生成3D CT-US体积，适配E:\new配准项目格式
   calibrate_quick.py  渲染 vs 物理代理指标对比与参数校准
   check_consistency.py 生成几何一致性自检（配准前回归测试）
   evaluate_registration.py 配准验收：TRE 统计、捕获范围、置信度、延迟
@@ -104,6 +105,24 @@ python scripts/generate_dataset.py \
 
 # 校准实验
 python scripts/calibrate_quick.py --data dataset/Task08_HepaticVessel/Task08_HepaticVessel
+```
+
+### 生成3D体积（适配E:\new配准项目）
+
+```bash
+# 生成3D CT-US体积，格式兼容E:\new的RigidRegistrationDataset
+python scripts/generate_for_new.py \
+  --liver dataset/Task03_Liver/Task03_Liver \
+  --out E:/new/data \
+  --n_cases 10 --n_elev 32 --elev_spacing 1.0 --seed 0
+
+# 输出格式:
+#   E:/new/data/ct/*.nii.gz  # 3D CT体积 (D,H,W), HU值
+#   E:/new/data/us/*.nii.gz  # 3D US体积 (D,H,W), float32 [0,1]
+#
+# E:\new的归一化:
+#   CT: (vol + 200) / 500.0
+#   US: (vol - vol.min()) / (vol.max() - vol.min())
 ```
 
 ### 数据集两档

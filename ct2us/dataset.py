@@ -61,6 +61,24 @@ def make_noise_volume(shape, rng, scale: int = 8, amp: float = 0.25) -> np.ndarr
     return np.exp(amp * full).astype(np.float32)
 
 
+def _iso_resample(ct, labels_liver, labels_vessel, affine, target_spacing):
+    """Resample CT + labels to isotropic target_spacing (mm)."""
+    pixdim = np.sqrt(np.sum(affine[:3, :3] ** 2, axis=0))
+    zoom = pixdim / float(target_spacing)
+    # cap memory: total output voxels ≤ 64M
+    out_voxels = int(np.prod(ct.shape) * np.prod(zoom))
+    if out_voxels > 64_000_000:
+        scale = (64_000_000 / out_voxels) ** (1.0 / 3)
+        zoom = np.clip(zoom, 0.1, None) * scale
+        print(f"  [iso] capped output voxels to {64_000_000}, spacing → {pixdim / zoom}")
+    ct_r = ndimage.zoom(ct, zoom, order=1).astype(np.float32)
+    aff_r = affine.copy()
+    aff_r[:3, :3] = affine[:3, :3] / zoom[:, None]
+    lr = ndimage.zoom(labels_liver.astype(np.int16), zoom, order=0).astype(np.int16) if labels_liver is not None else None
+    lv = ndimage.zoom(labels_vessel.astype(np.int16), zoom, order=0).astype(np.int16) if labels_vessel is not None else None
+    return ct_r, lr, lv, aff_r
+
+
 def classify_liver_from_ct(ct, tissue) -> np.ndarray:
     """Estimate a liver-like mask for cases without liver labels: the largest
     soft-tissue connected component co-located with the CT necrotic range."""
@@ -76,8 +94,11 @@ def classify_liver_from_ct(ct, tissue) -> np.ndarray:
 def load_case(task_dir: str, split: str = "imagesTr", case_name: str = "",
               has_liver_label: bool = True, has_vessel_label: bool = True,
               derive_vessels: bool = True, crop_margin_vox: int = 12,
-              rng=None) -> CaseContext:
-    """Load and fuse one case into a CaseContext."""
+              rng=None, iso_spacing=None) -> CaseContext:
+    """Load and fuse one case into a CaseContext.
+
+    iso_spacing: if set (mm), resample CT+labels to isotropic voxel size.
+    """
     task_dir = Path(task_dir)
     img_dir = task_dir / split
     lbl_dir = task_dir / split.replace("images", "labels")
@@ -94,6 +115,11 @@ def load_case(task_dir: str, split: str = "imagesTr", case_name: str = "",
         labels_liver = np.asarray(io.load_volume(lp)[0], dtype=np.int16)
     if is_vessel_task and lp.exists():
         labels_vessel = np.asarray(io.load_volume(lp)[0], dtype=np.int16)
+
+    # isotropic resampling BEFORE tissue building
+    if iso_spacing is not None:
+        ct, labels_liver, labels_vessel, affine = _iso_resample(
+            ct, labels_liver, labels_vessel, affine, iso_spacing)
 
     tissue = an.build_tissue_map(ct, labels_liver=labels_liver,
                                  labels_vessel=labels_vessel,
@@ -249,6 +275,67 @@ def _pose_json(pose: dict) -> dict:
     out = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in pose.items()}
     out.pop("kind", None)
     return out
+
+
+def generate_volume(ctx: CaseContext, rng, n_elev: int = 32,
+                    elev_spacing: float = 1.0,
+                    param: dict | None = None,
+                    global_params: dict | None = None) -> dict:
+    """Generate a 3D US volume by sweeping along the elevation direction.
+
+    Returns dict with:
+      - us_vol: (n_elev, nz, nx) float32 [0,1]
+      - ct_vol: (n_elev, nz, nx) float32 HU
+      - transform: dict with us_to_ct for center slice
+      - probe: probe params
+      - pose: pose dict for center slice
+    """
+    param = param or {}
+    global_params = global_params or {}
+
+    # Sample probe geometry (center slice)
+    probe, pose = sample_probe_geometry(ctx, rng, param)
+
+    # Elevation positions (offset from center)
+    elev_offsets = (np.arange(n_elev) - (n_elev - 1) / 2) * elev_spacing
+
+    us_slices = []
+    ct_slices = []
+
+    for i, offset in enumerate(elev_offsets):
+        # Shift face along elevation direction
+        slice_pose = dict(pose)
+        slice_pose["face"] = pose["face"] + pose["v"] * offset
+
+        # Generate 2D slice
+        deform_params = df.random_deform_params(probe, rng,
+                                                enabled=not global_params.get("no_deform", False))
+        deform = df.build_deformation(probe, deform_params, rng)
+        planes = resample_planes(ctx, probe, slice_pose, deform)
+
+        render_params = dict(global_params.get("render", {}))
+        out = render_mod.render_bmode(planes["ct"], planes["tissue"],
+                                      planes["scatter"], probe, render_params, rng,
+                                      want_envelope=True)
+
+        us_slices.append(out["uint8"].astype(np.float32) / 255.0)
+        ct_slices.append(planes["ct"].astype(np.float32))
+
+    # Stack into 3D volumes: (n_elev, nz, nx)
+    us_vol = np.stack(us_slices, axis=0)
+    ct_vol = np.stack(ct_slices, axis=0)
+
+    # Transform for center slice
+    transform = make_transform(probe, pose)
+
+    return {
+        "us_vol": us_vol,
+        "ct_vol": ct_vol,
+        "transform": transform,
+        "probe": probe,
+        "pose": pose,
+        "case": ctx.case,
+    }
 
 
 # ----------------------------------------------------------------------------

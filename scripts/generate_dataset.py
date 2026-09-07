@@ -35,7 +35,8 @@ from ct2us import io_utils
 def _worker(args):
     task_dir, label, name, split, per_volume, seed, out_root, global_params = args
     rng = np.random.default_rng(seed)
-    ctx = ds.load_case(task_dir, split, case_name=name)
+    ctx = ds.load_case(task_dir, split, case_name=name,
+                       iso_spacing=global_params.get("iso_spacing"))
     writer = ds.DatasetWriter(Path(out_root) / label.replace("\\", "_").replace("/", "_").replace(":", ""), name="index")
     metas = []
     for k in range(per_volume):
@@ -65,6 +66,8 @@ def main():
                     help="also render the physics-proxy reference sample")
     ap.add_argument("--no_deform", action="store_true",
                     help="disable breathing/pressure deformation (rigid set)")
+    ap.add_argument("--iso", type=float, default=None, metavar="MM",
+                    help="resample CT+labels to isotropic spacing (mm) before generation")
     args = ap.parse_args()
 
     tasks = []
@@ -84,7 +87,8 @@ def main():
             jobs.append((str(task_dir), label, n, args.split, args.per_volume,
                          int((args.seed + len(jobs)) % (2 ** 31)), args.out,
                          {"with_reference": bool(args.with_reference),
-                          "no_deform": bool(args.no_deform)}))
+                          "no_deform": bool(args.no_deform),
+                          "iso_spacing": args.iso}))
 
     print(f"{len(jobs)} case tasks to generate")
     if args.workers > 1 and len(jobs) > 1:
