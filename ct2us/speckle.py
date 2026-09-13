@@ -58,16 +58,22 @@ def time_gain_comp(db_per_cm: float = 0.6, freq: float = 3.5,
 
 
 def log_compress(env: np.ndarray, dynamic_range_db: float = 60.0,
-                 pct: float = 99.0, gamma: float = 1.0) -> np.ndarray:
+                 pct: float = 99.0, gamma: float = 1.0,
+                 ref: float | None = None) -> np.ndarray:
     """Envelope -> [0,1] log-compressed B-mode intensity.
 
-    The 100-DR-dB reference is placed at the pct-th percentile of the envelope
-    (in the log domain), which makes the displayed image robust to global gain.
+    `ref` 是**参考包络值**：
+      * `None`（历史默认）：取本图 `pct` 百分位。**每图自适应**，于是
+        "位姿 -> 像素"的映射附带一个全局缩放，任何基于绝对强度/一阶矩的目标
+        函数（MSE/L1/互信息）都会因此失稳。
+      * 给定数值：使用**固定绝对参考**，让不同位姿/不同散斑实现之间的亮度可比。
+        是否需要它由 `scripts/ab_observation.py` 的 A/B 实测决定，不凭直觉。
     """
     env = np.asarray(env, dtype=np.float64)
     env = np.maximum(env, 1e-12)
-    ref = np.percentile(env, pct)
-    dB = 20.0 * np.log10(env / max(ref, 1e-12))
+    if ref is None:
+        ref = np.percentile(env, pct)
+    dB = 20.0 * np.log10(env / max(float(ref), 1e-12))
     out = (dB + dynamic_range_db) / dynamic_range_db
     out = np.clip(out, 0.0, 1.0)
     if abs(gamma - 1.0) > 1e-6:

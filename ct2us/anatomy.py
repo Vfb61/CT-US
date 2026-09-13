@@ -142,14 +142,51 @@ def detect_vessels_heuristic(ct: np.ndarray, liver_mask: np.ndarray | None,
 # Wall rim construction
 # ----------------------------------------------------------------------------
 
-def vessel_wall_rim(lumen: np.ndarray, wall_thickness_vox: int = 2) -> np.ndarray:
-    """Wall = dilation(lumen)[:-eroded interior]. Thin shell around the lumen."""
+def vessel_wall_rim(lumen: np.ndarray, wall_thickness_vox: int = 2,
+                    preserve_lumen: bool = True,
+                    min_lumen_vox_for_wall: int = 200) -> np.ndarray:
+    """Wall ring around vessel lumina.
+
+    **历史缺陷（已修）**：旧实现 `wall = dilation(lumen, t) & ~erosion(lumen, 1)`
+    会把管腔**外圈全部吃掉**并把它们标成高回声的管壁。对细血管（CT 上肝内血管
+    半径常只有 1–3 voxel）`erosion(lumen,1)` 几乎为空，于是**整条血管都被改成
+    "亮壁"**：实测 8887 个管腔体素只剩 89 个。后果是超声里**血管不再是无回声
+    （黑）的管状结构，而是一堆亮斑**——而血管树恰恰是肝内最可靠、最能定位的
+    解剖标志；同时 `T_VESSEL` 标签几乎为空，任何依赖血管标签的监督/匹配都失效。
+
+    新规则（`preserve_lumen=True`，默认）：
+      * 管腔**完整保留**；
+      * 只有**体积 ≥ `min_lumen_vox_for_wall`** 的连通管腔才在外侧生成
+        `wall_thickness_vox` 厚的管壁环；
+      * 细血管不生成管壁（真实超声里也分辨不出壁），整体作为无回声管腔。
+
+    这样血管始终是「暗腔 + 亮壁」，与 CT/标签一致，才可能提供位姿信息。
+
+    `preserve_lumen=False` 可复现历史行为（仅用于对照实验）。
+    """
     lumen = np.asarray(lumen, dtype=bool)
     struct = ndimage.generate_binary_structure(3, 2)
-    dil = ndimage.binary_dilation(lumen, structure=struct, iterations=wall_thickness_vox)
-    ero = ndimage.binary_erosion(lumen, structure=struct, iterations=1)
-    wall = dil & ~ero
-    return wall
+    if not preserve_lumen:
+        dil = ndimage.binary_dilation(lumen, structure=struct, iterations=wall_thickness_vox)
+        ero = ndimage.binary_erosion(lumen, structure=struct, iterations=1)
+        return dil & ~ero
+
+    if not lumen.any():
+        return np.zeros_like(lumen)
+    if min_lumen_vox_for_wall > 0:
+        lab, n = ndimage.label(lumen, structure=struct)
+        if n == 0:
+            return np.zeros_like(lumen)
+        sizes = ndimage.sum(np.ones_like(lab), lab, index=np.arange(1, n + 1))
+        keep = np.zeros(n + 1, dtype=bool)
+        keep[1:] = sizes >= min_lumen_vox_for_wall
+        big = keep[lab]
+        if not big.any():
+            return np.zeros_like(lumen)
+    else:
+        big = lumen
+    dil = ndimage.binary_dilation(big, structure=struct, iterations=wall_thickness_vox)
+    return dil & ~big
 
 
 # ----------------------------------------------------------------------------
@@ -170,6 +207,7 @@ def build_tissue_map(ct: np.ndarray, labels_liver: np.ndarray | None = None,
     Returns an int16 volume with T_* codes.
     """
     shape = ct.shape
+    labelled = np.zeros(shape, dtype=bool)
 
     # 1) HU-based defaults
     if labels_liver is not None:
@@ -185,6 +223,7 @@ def build_tissue_map(ct: np.ndarray, labels_liver: np.ndarray | None = None,
         cancer = lab == 2
         tissue[liver] = T_LIVER
         tissue[cancer] = T_TUMOR
+        labelled |= liver | cancer
 
     # 3) vessels
     if labels_vessel is not None:
@@ -195,14 +234,19 @@ def build_tissue_map(ct: np.ndarray, labels_liver: np.ndarray | None = None,
         tissue[tum] = T_TUMOR
         wall = vessel_wall_rim(lumen)
         tissue[wall] = T_VESSEL_WALL
+        labelled |= lumen | tum | wall
     elif derive_vessels and liver_mask is not None:
         lumenv = detect_vessels_heuristic(ct, liver_mask)
         tissue[lumenv] = T_VESSEL
         wall = vessel_wall_rim(lumenv)
         tissue[wall] = T_VESSEL_WALL
+        labelled |= lumenv | wall
 
-    # 4) small cleanup: vessels/organs inside bone is implausible, remove noise
-    tissue = ndimage.median_filter(tissue.astype(np.int16), size=(1, 3, 3))
+    # 4) small cleanup only on the **HU-derived** voxels. 中值滤波会抹掉
+    #    1–2 voxel 厚的细血管腔/壁；标签派生的体素必须原样保留，否则血管
+    #    这一唯一的细解剖标志会被"清理"掉（正是历史数据失去定位信息的原因之一）。
+    filtered = ndimage.median_filter(tissue.astype(np.int16), size=(1, 3, 3))
+    tissue = np.where(labelled, tissue, filtered)
     return tissue.astype(np.int16)
 
 

@@ -64,14 +64,33 @@ def build_deformation(probe, params: dict, rng=None) -> callable:
     return deform
 
 
-def random_deform_params(probe, rng=None, enabled=True) -> dict:
-    """Sample deformation parameters for one generated slice."""
+def random_deform_params(probe, rng=None, enabled=True, prob: float | None = None,
+                         resp_amp_range=(0.5, 4.5)) -> dict:
+    """Sample deformation parameters for one generated slice.
+
+    Args:
+        enabled: False -> always return an all-zero (rigid) parameter set.
+        prob:    probability that a sample actually receives a **non-zero** deformation.
+                 Default 0.35 keeps the historical behaviour (i.e. ~65% non-zero).
+                 NOTE: with the default, a dataset generated *without* `--no_deform`
+                 is a **mixture** of rigid and deformed samples — each sample's
+                 `params.deform` must be inspected (or the GT treated as approximate
+                 for the deformed ones, whose displacement field is not persisted).
+        resp_amp_range: (lo, hi) mm for respiratory displacement.  Typical liver
+                 respiratory motion is 8-20 mm; the historical default (0.5, 4.5) is
+                 deliberately mild.  Pass e.g. (8.0, 20.0) for stronger realism.
+    """
     rng = rng if rng is not None else np.random.default_rng()
-    if not enabled or rng.random() < 0.35:
-        return {"resp_amp_mm": 0.0, "compression_mm": 0.0,
-                "resp_phase_rad": 0.0, "lateral_jitter_mm": 0.0}
+    zero = {"resp_amp_mm": 0.0, "compression_mm": 0.0,
+            "resp_phase_rad": 0.0, "lateral_jitter_mm": 0.0}
+    if not enabled:
+        return zero
+    p_nonzero = 0.65 if prob is None else float(np.clip(prob, 0.0, 1.0))
+    if rng.random() >= p_nonzero:
+        return zero
     p = {}
-    p["resp_amp_mm"] = float(rng.uniform(0.5, 4.5))
+    lo, hi = resp_amp_range
+    p["resp_amp_mm"] = float(rng.uniform(lo, hi))
     p["compression_mm"] = float(rng.uniform(0.0, 6.0))
     p["resp_phase_rad"] = float(rng.uniform(0, 2 * np.pi))
     p["lateral_jitter_mm"] = float(rng.uniform(0.0, 0.6))

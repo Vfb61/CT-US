@@ -53,6 +53,10 @@ DEFAULT_PARAMS = {
     "noise_snr_db": 38.0,
     "lumen_denoise": 0.6,
     "post_blur": (0.5, 0.8),
+    # 对数压缩的参考包络值。None = 本图 pct 百分位（历史默认，**每图自适应**）。
+    # 固定数值可让不同位姿/散斑实现之间的亮度可比；是否更好由
+    # `scripts/ab_observation.py` 实测决定，不凭直觉改。
+    "log_ref": None,
 }
 
 
@@ -201,7 +205,8 @@ def render_bmode(ct_plane: np.ndarray, tissue_plane: np.ndarray,
     if p["post_blur"] is not None:
         env = art.lateral_resolution(env, p["post_blur"][0], p["post_blur"][1])
 
-    bmode = sp.log_compress(env, dynamic_range_db=p["dr_db"], gamma=p["gamma"])
+    bmode = sp.log_compress(env, dynamic_range_db=p["dr_db"], gamma=p["gamma"],
+                            ref=p.get("log_ref"))
     out = {
         "bmode": bmode.astype(np.float32),
         "uint8": sp.to_uint8(bmode),

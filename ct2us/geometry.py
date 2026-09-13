@@ -183,6 +183,55 @@ class Probe:
         return p
 
 
+def probe_from_meta(meta: dict) -> Probe:
+    """从 `transform.npz` / `params.json["probe"]` 的字段重建 Probe。
+
+    关键点：`probe.dx` 对 convex 是**无意义的占位值**（例如 0.55，而真值是 0.1686），
+    真正可信的是 `dx_eff = lateral_span / nx`。因此这里优先用 meta 里的
+    `lateral_span`（缺失时用 `dx_eff * nx` 反推），再据此设置 `dx`，
+    避免下游把占位值当成横向像素间距。
+    """
+    kind = str(meta.get("kind", "convex"))
+    nx = int(meta.get("nx", 320))
+    nz = int(meta.get("nz", 280))
+    dx = float(meta.get("dx", 0.55))
+    span = meta.get("lateral_span", None)
+    dx_eff = meta.get("dx_eff", None)
+    if span is None and dx_eff is not None:
+        span = float(dx_eff) * nx
+    if span is not None:
+        span = float(span)
+        if kind == "convex":
+            # 已知 fov/radius 时反解 dx 无意义；直接用 span 设置 lateral_span，
+            # 并把 dx 设为等价 pitch 以便下游按 lateral_span/nx 取值。
+            dx = span / nx
+        else:
+            dx = span / nx
+    p = Probe(kind=kind, nx=nx, nz=nz, dx=dx,
+              fov_angle=float(meta.get("fov_angle", np.deg2rad(78.0))),
+              dz=float(meta.get("dz", 0.5)),
+              near=float(meta.get("near", 2.0)),
+              radius=float(meta.get("radius", 60.0)),
+              freq=float(meta.get("freq", 3.5)))
+    if span is not None:
+        p.lateral_span = span
+        p.dx_effective = span / nx
+    return p
+
+
+def world_grid_from_meta(meta: dict, pose: dict):
+    """由 meta(含 probe 字段) + pose(face/u/v/w) 重建扫描平面世界网格 (nx, nz, 3)。
+
+    这是**精确**几何来源（convex 的网格在 (i,j) 下非线性，无法用 affine 表达）。
+    """
+    p = probe_from_meta(meta)
+    face = np.asarray(pose["face"], dtype=np.float64)
+    u = np.asarray(pose["u"], dtype=np.float64)
+    v = np.asarray(pose["v"], dtype=np.float64)
+    w = np.asarray(pose["w"], dtype=np.float64)
+    return p.world_grid(face, u, v, w, deform=None)
+
+
 def build_probe(param: dict | None = None) -> Probe:
     """Create a Probe from an (optionally partially filled) parameter dict."""
     defaults = dict(kind="convex", nx=320, nz=280, dx=0.55,

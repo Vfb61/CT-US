@@ -37,7 +37,14 @@ from ct2us import io_utils
 
 
 def _rows(index_files):
-    rows = []
+    """读取索引并按 sid 去重（保留首次出现顺序，值取**最后一次**出现的行）。
+
+    去重是必须的：历史数据里存在多次重跑追加造成的陈旧重复行
+    （例如 pairs_v1/vessel_* 的 957 行里只有 872 个唯一 sid，79 条的
+    probe.(nx,nz) 与磁盘 us.png 尺寸不符），不去重会拿旧几何去核对新样本。
+    """
+    order: list[str] = []
+    by_key: dict[str, dict] = {}
     for f in index_files:
         f = Path(f)
         with open(f, encoding="utf-8") as fh:
@@ -47,8 +54,35 @@ def _rows(index_files):
                     continue
                 row = json.loads(line)
                 row["_base"] = str(f.parent)
-                rows.append(row)
-    return rows
+                row["_index_file"] = str(f)
+                sid = str(row.get("sid", ""))
+                if sid not in by_key:
+                    order.append(sid)
+                by_key[sid] = row
+    return [by_key[s] for s in order]
+
+
+def _image_size(path: Path):
+    """(nx, nz) of a PNG sample image, or None.
+
+    注意 us.png 是 numpy (nz, nx) 存成的图像，因此 PIL 的 (width, height) 对应
+    (nz, nx)；这里转回 (nx, nz) 以便与 probe 的取值直接比较。
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            w, h = im.size
+            return (h, w)
+    except Exception:
+        return None
+
+
+_PROBE_KEYS = ("kind", "nx", "nz", "dx", "dz", "fov_angle", "near", "radius", "freq")
+
+
+def _build_probe(pr_json: dict):
+    """用 probe_from_meta 重建（正确处理 convex 的 dx 占位值问题）。"""
+    return geo.probe_from_meta(pr_json)
 
 
 def _is_deformed(row) -> bool:
@@ -98,7 +132,7 @@ def _check(row) -> dict:
     base = Path(row["_base"])
     pr = row["params"]["probe"]
     po = row["params"]["pose"]
-    probe = geo.build_probe(pr)
+    probe = _build_probe(pr)
     face = np.asarray(po["face"], dtype=np.float64)
     u = np.asarray(po["u"], dtype=np.float64)
     v = np.asarray(po["v"], dtype=np.float64)
@@ -117,18 +151,43 @@ def _check(row) -> dict:
 
     tz = np.load(base / row["sid"] / "transform.npz")
     us_to_ct = tz["us_to_ct"]
-    det = float(np.linalg.det(us_to_ct[:3, :3]))
+    R = us_to_ct[:3, :3]
+    det = float(np.linalg.det(R))
+    # R 必须正交（旧检查只看 det，无法发现缩放/剪切）
+    orth = float(np.max(np.abs(R.T @ R - np.eye(3))))
     derived = ds.make_transform(probe,
                                 {"face": face, "u": u, "v": v, "w": w})["us_to_ct"]
     tmatch = float(np.max(np.abs(us_to_ct - derived)))
-    amatch = float(np.max(np.abs(np.asarray(stored_aff) - us_to_ct))) if stored_aff is not None else 0.0
+
+    # 切片 affine 必须与几何推导的平面 affine 一致（新格式）
+    if "slice_affine" in tz.files:
+        stored_slice_aff = tz["slice_affine"]
+        derived_slice_aff, slice_fit_err = ds.plane_affine_true(
+            probe, {"face": face, "u": u, "v": v, "w": w})
+        amatch = float(np.max(np.abs(stored_slice_aff - derived_slice_aff)))
+    else:
+        # 旧格式：affine 被错误地写成 us_to_ct，只报告不通过
+        stored_slice_aff = stored_aff
+        derived_slice_aff = None
+        slice_fit_err = float("nan")
+        amatch = float(np.max(np.abs(np.asarray(stored_aff) - us_to_ct))) if stored_aff is not None else 0.0
+
+    # 索引行与磁盘样本的一致性：probe.(nx,nz) 必须等于 us.png 尺寸
+    size = _image_size(base / row["sid"] / row["files"]["us"])
+    nx, nz = int(pr["nx"]), int(pr["nz"])
+    size_ok = (size is None) or (tuple(size) == (nx, nz))
+
     seg, _, _ = io_utils.load_volume(base / row["sid"] / "seg_slice.nii.gz")
     same_lbls = bool(np.array_equal(seg,
                      probe.resample(seg_vol, affine, world, cval=0.0, order=0)))
     return {
         "sid": row["sid"], "kind": pr["kind"], "rms": rms, "rel": rel,
-        "det": det, "tmatch": tmatch, "amatch": amatch,
+        "det": det, "orth": orth, "tmatch": tmatch, "amatch": amatch,
         "deformed": _is_deformed(row), "labels_match": same_lbls,
+        "size_ok": size_ok,
+        "png_size": None if size is None else tuple(int(v) for v in size),
+        "probe_nx_nz": (nx, nz),
+        "slice_affine_err": slice_fit_err,
     }
 
 
@@ -144,6 +203,8 @@ def main():
                     help="also cross-validate torch fan-accurate reslice vs stored slices")
     ap.add_argument("--threshold", type=float, default=0.05,
                     help="RMS (HU) threshold for rigid-sample failure")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="only check the first N samples (quick smoke check)")
     args = ap.parse_args()
 
     index_files = []
@@ -155,6 +216,8 @@ def main():
         ap.error("provide --index or --scan")
 
     rows = _rows(index_files)
+    if args.limit:
+        rows = rows[: args.limit]
     if not rows:
         print("no samples found")
         return 1
@@ -185,7 +248,8 @@ def main():
             tag = "DEFORMED" if r["deformed"] else "  rigid "
             line = (f"{tag} {r['sid']:<24} kind={r['kind']:<6} rms={r['rms']:9.4f} "
                     f"rel={r['rel']:.3e} det={r['det']:+.4f} "
-                    f"Tmatch={r['tmatch']:.2e} aff= {r['amatch']:.2e} "
+                    f"orth={r['orth']:.1e} Tmatch={r['tmatch']:.2e} "
+                    f"aff={r['amatch']:.2e} size_ok={r['size_ok']} "
                     f"labels={r['labels_match']}")
             if "torch_ct_rms" in r:
                 line += (f" | torch_ct_rms={r['torch_ct_rms']:.4f} "
@@ -200,11 +264,23 @@ def main():
     allmatch = [r["tmatch"] for r in ok_rows]
     if allmatch:
         print(f"transform match: max diff vs geometry-derived = {max(allmatch):.2e}")
+    orths = [r["orth"] for r in ok_rows]
+    if orths:
+        print(f"rotation orthogonality |R^T R - I|: max={max(orths):.3e} "
+              f"(旧检查只看 det，无法发现缩放/剪切)")
     dets = [r["det"] for r in ok_rows]
     if dets:
         print("determinants: min=%.4f max=%.4f" % (min(dets), max(dets)))
     print("labels resample identical to stored seg_slice:",
           sum(1 for r in ok_rows if r["labels_match"]), "/", len(ok_rows))
+    bad_size = [r for r in ok_rows if not r["size_ok"]]
+    print(f"index-vs-disk size consistency: {len(ok_rows) - len(bad_size)}/{len(ok_rows)} ok"
+          + (f"  ← {len(bad_size)} 条索引行的 (nx,nz) 与 us.png 不符（陈旧行或旧格式）" if bad_size else ""))
+    for r in bad_size[:5]:
+        print(f"    {r['sid']}: index says {r['probe_nx_nz']}, us.png is {r['png_size']}")
+    sae = [r["slice_affine_err"] for r in ok_rows if np.isfinite(r.get("slice_affine_err", np.nan))]
+    if sae:
+        print(f"slice affine 平面拟合残差(convex): max={max(sae):.4f} mm")
 
     # torch cross-validation summary
     torch_rows = [r for r in ok_rows if "torch_ct_rms" in r]

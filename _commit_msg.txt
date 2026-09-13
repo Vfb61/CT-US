@@ -1,0 +1,24 @@
+观测端修复（阶段A）+ 诊断工具
+
+关键修复（由实测驱动，见 new 仓库的 根源分析与可行方案.md）：
+
+* 对数压缩支持固定绝对参考 log_ref。原来是每图 99 百分位自适应，导致
+  位姿到像素的映射带全局缩放与裁剪阈值漂移（27-37% 像素被压在显示范围底）。
+  实测：梯度域真值盆地 prominence 0.111 -> 0.361，与降散斑+多实现平均叠加后 0.606
+* 每样本落盘 render_seed / noise_seed。原来 us.png 依赖生成顺序、完全不可复现，
+  重渲染只有 NCC 0.53；现在可精确复现（NCC 0.99998）
+* 同一位姿渲染 K 次独立散斑实现 + us_mean.png。单帧散斑幅度是位姿信号的 2-9 倍，
+  平均图让盆地峰值 16/16 落在真值
+* vessel_wall_rim 保留管腔。旧实现把管腔外圈全标成亮壁（hepaticvessel_001 的
+  管腔 8887 降到 89 体素），血管从暗腔加亮壁变成一堆亮斑，与 CT/标签不一致
+* 中值滤波只作用于 HU 派生体素，不再抹掉 1-2 voxel 厚的细血管
+* 新增位姿结构筛选 min_structure_frac，拒绝视野全是均匀肝实质的平面
+
+新增诊断/守门脚本：
+
+* probe_pose_info.py             同模态模板匹配盆地 + 检索 + 空间置换对照（16/16 峰值在真值）
+* measure_similarity_options.py  五种相似度体检 + 位姿/散斑方差分解（噪声/信号 2.4-4.6 倍）
+* ab_observation.py              观测端改动 A/B 与 log_ref 标定
+* basin_kframe.py                K 帧加权盆地测试（证伪：无实质收益）
+* verify_phase_a.py              阶段 A 验收：可复现性 + 盆地复验
+* fs_utils.py / backfill_metadata.py / check_consistency.py / generate_for_new.py 更新
