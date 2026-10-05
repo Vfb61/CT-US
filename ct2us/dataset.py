@@ -36,7 +36,8 @@ class CaseContext:
     def __init__(self, ct: np.ndarray, tissue: np.ndarray, affine: np.ndarray,
                  crop_box, liver_mask: np.ndarray | None, scatter: np.ndarray,
                  cam: str, structure: np.ndarray | None = None,
-                 noise_seed: int | None = None):
+                 noise_seed: int | None = None,
+                 vessel: np.ndarray | None = None):
         self.ct = ct
         self.tissue = tissue
         self.affine = affine
@@ -47,6 +48,9 @@ class CaseContext:
         # 可定位结构掩膜（血管腔/壁 + 肝包膜）。用于拒绝"视野内只有均匀肝实质"
         # 的位姿——那种平面上 CT 灰度与标签都近似常数，不含任何位姿信息。
         self.structure = structure
+        # **只含血管**的掩膜。点云路线（血管为配准基元）用它筛位姿：
+        # `structure` 里肝包膜占多数，按它筛会选出"贴肝表面但不穿血管"的平面。
+        self.vessel = vessel
         # scatter 噪声场的种子。**必须落盘**：它是影响 us.png 的随机量之一，
         # 不记录就无法精确复现前向模型（实测重渲染只有 NCC 0.53）。
         self.noise_seed = noise_seed
@@ -160,10 +164,10 @@ def load_case(task_dir: str, split: str = "imagesTr", case_name: str = "",
     noise = make_noise_volume(ct_c.shape, np.random.default_rng(int(noise_seed)))
     scatter = an.scatter_volume(tissue_c, spatial_noise=noise)
     structure = build_structure_mask(tissue_c)
+    vessel = build_vessel_mask(tissue_c)
 
     return CaseContext(ct_c, tissue_c, aff_c, box, liver_c, scatter, case_name,
-                       structure=structure, noise_seed=int(noise_seed))
-
+                       structure=structure, noise_seed=int(noise_seed), vessel=vessel)
 
 def build_structure_mask(tissue: np.ndarray) -> np.ndarray:
     """「可定位结构」掩膜：血管腔 + 血管壁 + 肝包膜（肝/非肝界面）。
@@ -186,15 +190,37 @@ def build_structure_mask(tissue: np.ndarray) -> np.ndarray:
 def plane_structure_fraction(ctx: CaseContext, probe: geo.Probe, pose: dict,
                              stride: int = 4, deform=None) -> float:
     """扫描平面上「结构像素」占比（0..1），用于位姿筛选（见 build_structure_mask）。"""
-    if ctx.structure is None or not ctx.structure.any():
-        return 1.0
+    return _plane_fraction(ctx, ctx.structure, probe, pose, stride, deform)
+
+
+def build_vessel_mask(tissue: np.ndarray) -> np.ndarray:
+    """**只含血管**（腔 + 壁）的掩膜，用于"平面必须穿过血管"的位姿筛选。
+
+    点云路线（CT 点云 ↔ 超声点云，血管为配准基元）必须用这个筛位姿：
+    实测用合体结构掩膜（含肝包膜）筛出的平面**一个血管都不穿** ——
+    32 层的扫掠体里血管体素 = 0，标签直方图只有 air/bone/liver。
+    """
+    return (tissue == an.T_VESSEL) | (tissue == an.T_VESSEL_WALL)
+
+
+def _plane_fraction(ctx: CaseContext, mask, probe: geo.Probe, pose: dict,
+                    stride: int = 4, deform=None) -> float:
+    """给定掩膜在扫描平面上的像素占比（0..1）。"""
+    if mask is None or not np.asarray(mask).any():
+        return 0.0
     world = probe.world_grid(pose["face"], pose["u"], pose["v"], pose["w"], deform=deform)
     sub = np.ascontiguousarray(world[::stride, ::stride])
     if sub.size == 0:
-        return 1.0
+        return 0.0
     sp = probe.copy(nx=sub.shape[0], nz=sub.shape[1])
-    s = sp.resample(ctx.structure.astype(np.float32), ctx.affine, sub, cval=0.0, order=0)
+    s = sp.resample(np.asarray(mask, dtype=np.float32), ctx.affine, sub, cval=0.0, order=0)
     return float((s > 0.5).mean())
+
+
+def plane_vessel_fraction(ctx: CaseContext, probe: geo.Probe, pose: dict,
+                          stride: int = 4, deform=None) -> float:
+    """扫描平面上「血管像素」占比（0..1）。点云路线的位姿筛选用它。"""
+    return _plane_fraction(ctx, getattr(ctx, "vessel", None), probe, pose, stride, deform)
 
 
 # ----------------------------------------------------------------------------
@@ -213,6 +239,7 @@ def sample_probe_geometry(ctx: CaseContext, rng, param=None) -> tuple[geo.Probe,
     kind_pool = param.get("kinds", ["convex", "convex", "linear"])
     liver_surf = ctx.probe()
     min_struct = float(param.get("min_structure_frac", 0.0))
+    min_vessel = float(param.get("min_vessel_frac", 0.0))
     best = None
 
     for _ in range(60):
@@ -246,6 +273,16 @@ def sample_probe_geometry(ctx: CaseContext, rng, param=None) -> tuple[geo.Probe,
         if not (frac >= frac_min
                 and max_d >= param.get("min_depth_fraction", 0.25) * pr.depth_span):
             continue
+        # 血管专项筛选（点云路线必需）：平面必须真的穿过血管，
+        # 否则超声侧一个血管点都提不出来。
+        if min_vessel > 0.0:
+            vf = plane_vessel_fraction(ctx, pr, pose)
+            if vf < min_vessel:
+                if best is None or vf > best[0]:
+                    best = (vf, pr, pose)
+                continue
+            if min_struct <= 0.0:
+                return pr, pose
         if min_struct <= 0.0:
             return pr, pose
         sf = plane_structure_fraction(ctx, pr, pose)

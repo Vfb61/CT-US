@@ -28,6 +28,7 @@ Parameter dictionary (render):
 from __future__ import annotations
 
 import numpy as np
+from scipy import ndimage
 
 from . import anatomy as an
 from . import artifacts as art
@@ -37,7 +38,15 @@ from . import speckle as sp
 DEFAULT_PARAMS = {
     "global_gain": 2.2,
     "alpha_scale": 1.0,
-    "tgc_slope_db_cm": 0.7,
+    # TGC 深度补偿斜率。**实测校准值，不是从 α 反算的**：
+    # 早先按"抵消代码施加的单向衰减"(α·f = 2.45 dB/cm) 取 2.0，实测中场
+    # (80~240 px) 肝亮度仍掉 15.1 dB。原因是轴向梯度的主要来源不是组织衰减
+    # ——`acoustic_shadow` 修掉重复计入后，alpha 项已不再叠加——而是**近场镜面
+    # 回声把浅部抬亮**，加上组织成分随深度变化。
+    # 按 `scripts/diag_envelope_db.py` 的深度剖面扫描：
+    #   2.0 → 中场落差 15.1 dB ；3.0 → 8.9 dB ；3.8 → 4.4 dB
+    # 取 3.4（落差 ≈6.7 dB，兼顾远场不被过补偿吹亮，判据要求 ≤6 dB 量级）。
+    "tgc_slope_db_cm": 3.4,
     "dr_db": 62.0,
     "gamma": 1.0,
     "speckle_strength": 0.7,
@@ -50,7 +59,13 @@ DEFAULT_PARAMS = {
     "posterior_db": 8.0,
     "edge_shadow_w": 0.5,
     "reverb_gain": 0.3,
-    "noise_snr_db": 38.0,
+    # 加性噪声：**组织参考信号与噪声底之比**，参考量取该层包络的 99 分位
+    # （见 `artifacts.additive_noise`：早先用 max(env) 是镜面尖峰，不可比）。
+    # 38 → 58 的实测依据：无回声腔本来就应低于噪声底附近的灰度，但**不能
+    # 埋进噪声底**。真实血液背向散射比组织低 20~30 dB，而噪声底应更低。
+    # 实测 snr=50 时病例 005 的腔只高于噪声底 +0.3 dB（腔包络 0.0189 / σ 0.0182），
+    # 即腔被噪声底托住、丧失灰度信息；提到 58 使腔高于噪声底 ≈ +8 dB。
+    "noise_snr_db": 58.0,
     "lumen_denoise": 0.6,
     "post_blur": (0.5, 0.8),
     # 对数压缩的参考包络值。None = 本图 pct 百分位（历史默认，**每图自适应**）。
@@ -110,16 +125,36 @@ def _specular_echo(ct_plane: np.ndarray, tissue_plane: np.ndarray,
     spec[edge_lat] = np.maximum(spec[edge_lat], 1.4 * params["specular_gain"])
     spec[edge_dep] = np.maximum(spec[edge_dep], 1.8 * params["specular_gain"])
 
-    # vessel walls
+    # 血管壁：**镜面回声必须依赖界面朝向**。只有法向接近声束的壁面（管腔的顶/底）
+    # 才强反射，平行于声束的侧壁几乎不回波。
+    # 旧实现 `spec[wall] = max(spec[wall], wall_echo_gain)` 给**所有**壁体素一个
+    # 常数强反射，等于把只有 2 体素厚的管壁整圈点成强反射体；再经 post_blur 的
+    # PSF 糊进腔内，直接抬亮"暗腔"。实测这是暗腔对比度不足的主因之一。
+    # 这里用上面已算出的束向对齐度 ref∈[0,1] 加权，并保留一个小底值。
     wall = tissue_plane == an.T_VESSEL_WALL
-    spec[wall] = np.maximum(spec[wall], params["wall_echo_gain"])
+    wall_echo = params["wall_echo_gain"] * (0.15 + 0.85 * np.clip(ref, 0.0, 1.0))
+    spec[wall] = np.maximum(spec[wall], wall_echo[wall])
 
-    # CT-gradient-based capsule line (double-line bright rim)
+    # CT 梯度项：本意是「肝包膜双线亮边」（见原注释）。旧实现的掩膜写成
+    # `& (liver | non_liver)`，该式**恒为真**，等于对全图 CT 梯度前 8% 的体素
+    # 一律加 0.5*specular_gain 的镜面回声。**血管腔的边界本身就是强 CT 梯度**，
+    # 于是腔被点亮，进一步抹掉"暗腔亮壁"。这里把掩膜收回到肝包膜附近的窄带，
+    # 恢复注释所声明的意图。
+    band = _capsule_band(liver)
     ctg = np.abs(np.gradient(ct_plane, axis=1)) + np.abs(np.gradient(ct_plane, axis=0))
-    strong = (ctg > np.percentile(ctg, 92.0)) & (liver | non_liver)
+    strong = (ctg > np.percentile(ctg, 92.0)) & band
     spec[strong] = np.maximum(spec[strong], params["specular_gain"] * 0.5)
 
     return spec
+
+
+def _capsule_band(liver: np.ndarray, it: int = 3) -> np.ndarray:
+    """肝包膜附近的窄带（肝边界外扩 it 体素），用于限制"包膜亮边"项的作用范围。"""
+    if not liver.any():
+        return np.zeros(liver.shape, dtype=bool)
+    st = ndimage.generate_binary_structure(2, 1)
+    cap = liver & ~ndimage.binary_erosion(liver, structure=st, iterations=1)
+    return ndimage.binary_dilation(cap, structure=st, iterations=it)
 
 
 def _strength_map(tissue_plane: np.ndarray, params) -> np.ndarray:
@@ -171,19 +206,20 @@ def render_bmode(ct_plane: np.ndarray, tissue_plane: np.ndarray,
     # 4) TGC (linear-domain compensation, applied mildly)
     depths = probe.depth_offsets() / 10.0  # cm
     gain_db = p["tgc_slope_db_cm"] * depths
-    tgc = 10.0 ** (np.clip(gain_db, 0.0, 40.0) / 20.0)
+    # TGC 上限：斜率提高后 14 cm 深处需要 ~45 dB，40 dB 会提前截顶、
+    # 使远场重新变暗，故放宽到 60 dB。
+    tgc = 10.0 ** (np.clip(gain_db, 0.0, 60.0) / 20.0)
     env = env * tgc[None, :]
 
     # 5) artefacts
     spec_mask = spec > 0.5 * max(spec.max(), 1e-6)
-    env = art.acoustic_shadow(env, alpha, spec_mask, dz_cm, probe.freq,
+    env = art.acoustic_shadow(env, spec_mask, dz_cm,
                               shadow_db=p["shadow_db"], spec_block_db=p["spec_block_db"])
     env = art.posterior_enhancement(env, alpha, ref_alpha=0.7,
                                     dz_cm=dz_cm, freq=probe.freq,
                                     max_boost_db=p["posterior_db"])
 
-    shadow_ref = art.acoustic_shadow(np.ones_like(env), alpha, spec_mask,
-                                     dz_cm, probe.freq,
+    shadow_ref = art.acoustic_shadow(np.ones_like(env), spec_mask, dz_cm,
                                      shadow_db=p["shadow_db"], spec_block_db=p["spec_block_db"])
     env = art.edge_shadow(env, shadow_ref, lat_px=3.0, strength=p["edge_shadow_w"])
 
@@ -199,6 +235,8 @@ def render_bmode(ct_plane: np.ndarray, tissue_plane: np.ndarray,
     if p["lumen_denoise"] > 0:
         env = art.speckle_denoise_lumen(env, lumen, strength=p["lumen_denoise"])
 
+    # 记录噪声底 σ（**必须在加噪之前算**，加噪后分位数本身会被抬高）
+    n_sigma = art.noise_sigma(env, p["noise_snr_db"])
     env = art.additive_noise(env, snr_db=p["noise_snr_db"], rng=rng)
 
     # 6) PSF-like final blur + envelope/log compression
@@ -214,6 +252,8 @@ def render_bmode(ct_plane: np.ndarray, tissue_plane: np.ndarray,
         "alpha_plane": alpha,
         "tissue_plane": tissue_plane,
         "specular_plane": spec,
+        # 噪声底（加噪前的 σ），供"腔信号 vs 噪声底余量"诊断使用
+        "noise_sigma": float(n_sigma),
         "params": p,
     }
     if not want_envelope:

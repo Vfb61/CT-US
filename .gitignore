@@ -24,6 +24,12 @@ desktop.ini
 dataset/
 outputs/
 
+# 可视化导出（由 scripts/export_ct_preview.py 等生成，45 MB，可随时重跑）
+preview/
+
+# 诊断过程的临时输出（.err 日志、中间 json）
+_probe/
+
 # PyTorch checkpoints
 *.pt
 *.pth
